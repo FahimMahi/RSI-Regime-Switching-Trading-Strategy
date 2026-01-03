@@ -1,0 +1,320 @@
+import os
+import pandas as pd
+import argparse
+import talib  # for RSI calculation
+from modules.dataset_loader import load_dataset, load_test_dataset
+from modules.preprocessing import rename_col, handling_nan_after_feature_generate
+from modules.chart import generate_signal_plot
+from modules.signal_label_processing import generate_signal_only_extrema, shift_signals, signal_propagate
+from modules.feature_generate import extract_all_features
+from modules.signal_label_processing import (
+    generate_signal_only_extrema,
+    shift_signals,
+    signal_propagate,
+    remove_low_volatility_signals,
+    filter_by_slope,
+    prior_signal_making_zero
+)
+from modules.feature_selection import select_best_features
+from modules.models import xgbmodel, xgbmodel_adasyn, load_model, save_model, predict_with_new_dataset
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+from keras.models import Sequential
+from keras.layers import LSTM, GRU, Dense
+import xgboost as xgb
+from sklearn.linear_model import Lasso
+from sklearn.preprocessing import StandardScaler
+
+def visualize_dataset(df, processed, limit=3000):
+    df.reset_index(inplace=True, drop=True)
+    generate_signal_plot(df, val_limit=limit)
+    generate_signal_plot(generate_signal_only_extrema(df), val_limit=limit)
+    generate_signal_plot(shift_signals(df), val_limit=limit)
+    generate_signal_plot(signal_propagate(shift_signals(df)), val_limit=limit)
+
+    generate_signal_plot(processed, val_limit=limit)
+    generate_signal_plot(filter_by_slope(processed), val_limit=limit)
+    generate_signal_plot(filter_by_slope(processed, look_ahead=30), val_limit=limit)
+
+
+def generate_rsi_signals(data, rsi_period=14, buy_threshold=30, sell_threshold=70):
+    data['RSI'] = talib.RSI(data['close'], timeperiod=rsi_period)
+    data['Signal'] = 0
+    data.loc[data['RSI'] < buy_threshold, 'Signal'] = 1  # Buy signal
+    data.loc[data['RSI'] > sell_threshold, 'Signal'] = -1  # Sell signal
+    return data
+
+
+def detect_market_regime(data):
+    data['SMA_50'] = data['close'].rolling(window=50).mean()
+    data['SMA_200'] = data['close'].rolling(window=200).mean()
+    data['Regime'] = 'Ranging'
+    data.loc[data['SMA_50'] > data['SMA_200'], 'Regime'] = 'Trending'
+    return data
+
+
+def extract_features(data):
+    data['SMA_50'] = data['SMA_50']
+    data['SMA_200'] = data['SMA_200']
+    data['RSI'] = data['RSI']
+    data['Regime'] = data['Regime'].map({'Trending': 1, 'Ranging': 0})  # Convert regime to numeric
+    data['MACD'], data['MACD_signal'], _ = talib.MACD(data['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+    data['ATR'] = talib.ATR(data['high'], data['low'], data['close'], timeperiod=14)
+    return data.dropna()  # Drop rows with missing values
+
+
+def build_lstm_model(X_train):
+    model = Sequential()
+    model.add(LSTM(50, activation='relu', input_shape=(X_train.shape[1], 1)))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+def build_gru_model(X_train):
+    model = Sequential()
+    model.add(GRU(50, activation='relu', input_shape=(X_train.shape[1], 1)))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+import pickle
+
+def save_model(model, model_name):
+    """
+    Save the trained model to a file using pickle.
+    :param model: Trained model object
+    :param model_name: Name of the model to save it as (e.g., 'XGBoost', 'Logistic Regression')
+    """
+    model_filename = f"{model_name}_model.pkl"
+    with open(model_filename, 'wb') as file:
+        pickle.dump(model, file)
+    print(f"Model saved as {model_filename}")
+
+class SignalMLPipeline:
+    def __init__(self, data_dir, file_name, test_file_path, n_features=20):
+        self.y = None
+        self.X = None
+        self.data_dir = data_dir
+        self.file_name = file_name
+        self.test_file_path = test_file_path
+        self.n_features = n_features
+
+        self.raw_data = None
+        self.dataset = None
+        self.df_features = None
+        self.selected_features = None
+        self.pipe = None
+        self.model = None
+        self.models = {}
+
+        # Step functions (load, label, visualize, features, select, train, save, test)
+        self.step_functions = {
+            1: ("load", self.load_and_prepare_raw_data),
+            2: ("label", self.generate_labels),
+            3: ("visualize", self.visualize_current_dataset),
+            4: ("features", self.extract_features),
+            5: ("select", self._feature_selection_wrapper),
+            6: ("train", self._train_wrapper),
+            7: ("save", self.save),
+            8: ("test", self.test_new_dataset)
+        }
+
+    def load_and_prepare_raw_data(self):
+        print("Loading dataset...")
+        dt = load_dataset(self.data_dir, self.file_name)
+        dt = rename_col(dt)
+        self.raw_data = dt
+        print(self.raw_data.head())
+
+    def generate_labels(self):
+        print("Generating labels based on RSI signals...")
+
+        # Generate RSI and Regime Signals
+        self.raw_data = generate_rsi_signals(self.raw_data)
+        self.raw_data = detect_market_regime(self.raw_data)
+
+        # Map the signal values for classification
+        self.raw_data['Signal'] = self.raw_data['Signal'].map({-1: 2, 0: 0, 1: 1})  # -1 -> 2, 0 -> 0, 1 -> 1
+
+        # Drop any rows with missing values in the 'Signal' column or other critical columns
+        self.raw_data.dropna(subset=['Signal'], inplace=True)
+
+        # Ensure no NaN values in target (Signal) column
+        if self.raw_data['Signal'].isnull().any():
+            print("[!] Warning: NaN values detected in 'Signal'. Dropping rows with NaN values.")
+            self.raw_data.dropna(subset=['Signal'], inplace=True)
+
+        # Make sure the dataset is valid for feature extraction
+        self.dataset = extract_features(self.raw_data)
+
+    def extract_features(self):
+        print("Extracting features...")
+        df_feat = self.dataset
+        df_feat = handling_nan_after_feature_generate(df_feat)
+        self.df_features = df_feat
+
+    def _feature_selection_wrapper(self):
+        self.X, self.y = self.feature_selection()
+
+    def _train_wrapper(self):
+        if not hasattr(self, "X") or not hasattr(self, "y"):
+            raise RuntimeError("Features not generated yet. Run step 4 (select) before step 5 (train).")
+        self.train_model(self.X, self.y)
+
+    def feature_selection(self):
+        """
+        Perform feature selection using XGBoost's feature importance and Lasso (L1 regularization).
+        :return: selected features and corresponding target variable
+        """
+        print("Performing feature selection using XGBoost's feature importance and Lasso...")
+
+        # Prepare the dataset
+        df = self.df_features.dropna(subset=["Signal"]).copy()
+        X = df.drop(columns=["Signal"])  # Features
+        y = df["Signal"]  # Target variable (Signal: 1 for buy, -1 for sell)
+
+        # Drop rows with NaN in features or target variable
+        X = X.dropna()
+        y = y[X.index]  # Ensure that y has the same index as X after dropping NaNs
+
+        # Check for NaN in y before proceeding
+        if y.isnull().any():
+            print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
+            X = X[~y.isnull()]
+            y = y.dropna()  # Drop rows where y is NaN
+
+        # Step 1: Use XGBoost to compute feature importance
+        model = xgb.XGBClassifier()  # No need to set use_label_encoder=False anymore
+        model.fit(X, y)
+        feature_importance = model.feature_importances_
+
+        # Step 2: Select the top N features based on XGBoost importance
+        important_features = X.columns[feature_importance > 0.01]  # Adjust threshold if needed
+        X_selected = X[important_features]
+
+        # Step 3: Apply Lasso (L1 regularization) for further feature selection
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_selected)
+        lasso = Lasso(alpha=0.01)  # Tune alpha for better results
+        lasso.fit(X_scaled, y)
+
+        # Get features with non-zero coefficients (important features)
+        selected_features = X_selected.columns[lasso.coef_ != 0]
+
+        # Store the selected features
+        self.selected_features = list(selected_features)
+        print(f"Selected Features: {self.selected_features}")
+
+        return X[selected_features], y
+
+
+
+
+    def train_model(self, X, y):
+        print("Training model...")
+
+        # Ensure that y doesn't contain NaN values
+        if y.isnull().any():
+            print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
+            X = X[~y.isnull()]
+            y = y.dropna()  # Drop rows where y is NaN
+
+        # Ensure the selected features are not missing
+        print(f"Shape of X: {X.shape}")
+        print(f"Shape of y: {y.shape}")
+
+        # Add all models to the pipeline and train them
+        models = {
+            'XGBoost': xgb.XGBClassifier(),
+            'Logistic Regression': LogisticRegression(),
+            'Random Forest': RandomForestClassifier(),
+            'SVM': SVC(),
+        }
+
+        for model_name, model in models.items():
+            print(f"Training {model_name}...")
+            model.fit(X, y)
+            y_pred = model.predict(X)
+            accuracy = accuracy_score(y, y_pred)
+            precision = precision_score(y, y_pred, average='weighted')
+            recall = recall_score(y, y_pred, average='weighted')
+            f1 = f1_score(y, y_pred, average='weighted')
+
+            print(f"{model_name} - Accuracy: {accuracy}, Precision: {precision}, Recall: {recall}, F1-score: {f1}")
+
+            # Save the model after training
+            self.models[model_name] = model
+            # Pass both the model and the model_name to save_model
+            save_model(model, model_name)  # Ensure this is calling the correct method
+
+
+
+    def save(self):
+        print("Model saved successfully.")
+
+    def load(self):
+        self.pipe, self.selected_features, self.model = load_model()
+        print("Model loaded successfully.")
+
+    def test_new_dataset(self):
+        print("Loading test dataset...")
+        test_df = load_test_dataset(self.test_file_path)
+        test_df = rename_col(test_df)
+        test_df = extract_features(test_df)
+        # Further testing logic here...
+
+    def visualize_current_dataset(self):
+        print(">>> Visualizing dataset with all preprocessing steps...")
+        if not hasattr(self, "dataset"):
+            print("[!] dataset missing → generating labels")
+            self.generate_labels()  # Ensure the dataset is ready
+        visualize_dataset(self.raw_data, self.dataset)  # This will call the visualization function
+
+    def run_pipeline(self, start_step_=1, end_step_=7):
+        print(f"Running pipeline from step {start_step_} to {end_step_}")
+        for step in range(start_step_, end_step_ + 1):
+            step_name, func = self.step_functions[step]
+            print(f"Running step: {step_name}")
+            func()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="RSI Regime-Switching Trading Strategy Pipeline")
+
+    parser.add_argument("--start", type=str, default="1", help="Start step (number or name)")
+    parser.add_argument("--end", type=str, default="7", help="End step (number or name)")
+
+    args = parser.parse_args()
+
+    step_map = {
+        "load": 1,
+        "label": 2,
+        "visualize": 3,
+        "features": 4,
+        "select": 5,
+        "train": 6,
+        "save": 7,
+        "test": 8
+    }
+
+    def convert_step(x):
+        if x.isdigit():
+            return int(x)
+        return step_map[x.lower()]
+
+    start_step = convert_step(args.start)
+    end_step = convert_step(args.end)
+
+    # Path Configuration
+    data_dir = r"datasets"  # Ensure this path is correct
+    file_name = "Cleaned_Signal_EURUSD_for_training_635_635_60000.csv"
+    test_file_path = r"datasets\GBPUSD_H1_20140525_20251220.csv"
+
+    # Create pipeline instance
+    pipeline = SignalMLPipeline(data_dir, file_name, test_file_path, n_features=20)
+
+    # Run pipeline
+    pipeline.run_pipeline(start_step, end_step)

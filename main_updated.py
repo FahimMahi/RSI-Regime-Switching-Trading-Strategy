@@ -3,12 +3,12 @@ import pandas as pd
 import argparse
 import talib  # for RSI calculation
 from modules.dataset_loader import load_dataset, load_test_dataset
-from modules.preprocessing import (
-    rename_col,
-    handling_nan_after_feature_generate,
-    prepare_dataset_for_model
-)
+from modules.preprocessing import rename_col, handling_nan_after_feature_generate
 from modules.chart import generate_signal_plot
+from modules.signal_label_processing import generate_signal_only_extrema, shift_signals, signal_propagate
+from modules.feature_generate import extract_all_features
+from modules.feature_selection import select_best_features
+from modules.models import xgbmodel, xgbmodel_adasyn, load_model, save_model, predict_with_new_dataset
 from modules.signal_label_processing import (
     generate_signal_only_extrema,
     shift_signals,
@@ -17,78 +17,17 @@ from modules.signal_label_processing import (
     filter_by_slope,
     prior_signal_making_zero
 )
-from modules.feature_generate import extract_all_features
-from modules.feature_selection import select_best_features
-from modules.models import (
-    xgbmodel,
-    xgbmodel_adasyn,
-    xgbmodel_kfold,
-    xgbmodel_comparison_with_adasyn_smote,
-    load_model,
-    save_model,
-    predict_with_new_dataset
-)
-
-def visualize_dataset(df, processed, limit=3000):
-    df.reset_index(inplace=True, drop=True)
-    generate_signal_plot(df, val_limit=limit)
-    generate_signal_plot(generate_signal_only_extrema(df), val_limit=limit)
-    generate_signal_plot(shift_signals(df), val_limit=limit)
-    generate_signal_plot(signal_propagate(shift_signals(df)), val_limit=limit)
-
-    generate_signal_plot(processed, val_limit=limit)
-    generate_signal_plot(filter_by_slope(processed), val_limit=limit)
-    generate_signal_plot(filter_by_slope(processed, look_ahead=30), val_limit=limit)
-
+# Importing necessary libraries for ML models
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from keras.models import Sequential
+from keras.layers import LSTM, GRU, Dense
 import xgboost as xgb
 from sklearn.linear_model import Lasso
 from sklearn.preprocessing import StandardScaler
 
-# def feature_selection(self):
-#     """
-#     Perform feature selection using XGBoost's feature importance and Lasso (L1 regularization).
-#     :return: selected features and corresponding target variable
-#     """
-#     print("Performing feature selection using XGBoost's feature importance and Lasso...")
-
-#     # Prepare the dataset
-#     df = self.df_features.dropna(subset=["Signal"]).copy()
-#     X = df.drop(columns=["Signal"])  # Features
-#     y = df["Signal"]  # Target variable (Signal: 1 for buy, -1 for sell)
-
-#     # Drop rows with NaN in features or target variable
-#     X = X.dropna()
-#     y = y[X.index]  # Ensure that y has the same index as X after dropping NaNs
-
-#     # Check for NaN in y before proceeding
-#     if y.isnull().any():
-#         print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
-#         X = X[~y.isnull()]
-#         y = y.dropna()  # Drop rows where y is NaN
-
-#     # Step 1: Use XGBoost to compute feature importance
-#     model = xgb.XGBClassifier(use_label_encoder=False)
-#     model.fit(X, y)
-#     feature_importance = model.feature_importances_
-
-#     # Step 2: Select the top N features based on XGBoost importance
-#     important_features = X.columns[feature_importance > 0.01]  # Adjust threshold if needed
-#     X_selected = X[important_features]
-
-#     # Step 3: Apply Lasso (L1 regularization) for further feature selection
-#     scaler = StandardScaler()
-#     X_scaled = scaler.fit_transform(X_selected)
-#     lasso = Lasso(alpha=0.01)  # Tune alpha for better results
-#     lasso.fit(X_scaled, y)
-
-#     # Get features with non-zero coefficients (important features)
-#     selected_features = X_selected.columns[lasso.coef_ != 0]
-
-#     # Store the selected features
-#     self.selected_features = list(selected_features)
-#     print(f"Selected Features: {self.selected_features}")
-
-#     return X[selected_features], y
 
 def generate_rsi_signals(data, rsi_period=14, buy_threshold=30, sell_threshold=70):
     """
@@ -105,6 +44,7 @@ def generate_rsi_signals(data, rsi_period=14, buy_threshold=30, sell_threshold=7
     data.loc[data['RSI'] > sell_threshold, 'Signal'] = -1  # Sell signal
     return data
 
+
 def detect_market_regime(data):
     """
     Classify the market as trending or ranging based on SMA.
@@ -118,6 +58,18 @@ def detect_market_regime(data):
     data['Regime'] = 'Ranging'
     data.loc[data['SMA_50'] > data['SMA_200'], 'Regime'] = 'Trending'
     return data
+
+def visualize_dataset(df, processed, limit=3000):
+    df.reset_index(inplace=True, drop=True)
+    generate_signal_plot(df, val_limit=limit)
+    generate_signal_plot(generate_signal_only_extrema(df), val_limit=limit)
+    generate_signal_plot(shift_signals(df), val_limit=limit)
+    generate_signal_plot(signal_propagate(shift_signals(df)), val_limit=limit)
+
+    generate_signal_plot(processed, val_limit=limit)
+    generate_signal_plot(filter_by_slope(processed), val_limit=limit)
+    generate_signal_plot(filter_by_slope(processed, look_ahead=30), val_limit=limit)
+
 
 def extract_features(data):
     """
@@ -136,47 +88,28 @@ def extract_features(data):
 
     return data.dropna()  # Drop rows with missing values
 
-from sklearn.model_selection import GridSearchCV
-from xgboost import XGBClassifier
 
-# def train_model(self, X, y):
-#     print("Training model...")
+def build_lstm_model(X_train):
+    """
+    Build LSTM model for classification
+    """
+    model = Sequential()
+    model.add(LSTM(50, activation='relu', input_shape=(X_train.shape[1], 1)))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
 
-#     # Ensure that y doesn't contain NaN values
-#     if y.isnull().any():
-#         print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
-#         X = X[~y.isnull()]
-#         y = y.dropna()  # Drop rows where y is NaN
 
-#     # Ensure the selected features are not missing
-#     print(f"Shape of X: {X.shape}")
-#     print(f"Shape of y: {y.shape}")
+def build_gru_model(X_train):
+    """
+    Build GRU model for classification
+    """
+    model = Sequential()
+    model.add(GRU(50, activation='relu', input_shape=(X_train.shape[1], 1)))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
 
-#     model = xgb.XGBClassifier(use_label_encoder=False)
-#     model.fit(X, y)
-#     self.model = model
-
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-def evaluate_model(self, X_test, y_test):
-    print("Evaluating model...")
-
-    # Make predictions
-    y_pred = self.model.predict(X_test)
-
-    # Calculate evaluation metrics
-    accuracy = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred, average='weighted')
-    recall = recall_score(y_test, y_pred, average='weighted')
-    f1 = f1_score(y_test, y_pred, average='weighted')
-
-    print(f"Accuracy: {accuracy}")
-    print(f"Precision: {precision}")
-    print(f"Recall: {recall}")
-    print(f"F1-score: {f1}")
-
-    # Optionally backtest using historical data
-    self.backtest(X_test, y_test)
 
 class SignalMLPipeline:
     """
@@ -239,7 +172,6 @@ class SignalMLPipeline:
         # Make sure the dataset is valid for feature extraction
         self.dataset = extract_features(self.raw_data)
 
-
     def extract_features(self):
         print("Extracting features...")
         df_feat = self.dataset
@@ -277,7 +209,7 @@ class SignalMLPipeline:
             y = y.dropna()  # Drop rows where y is NaN
 
         # Step 1: Use XGBoost to compute feature importance
-        model = xgb.XGBClassifier(use_label_encoder=False)
+        model = xgb.XGBClassifier() # No need to set use_label_encoder=False anymore
         model.fit(X, y)
         feature_importance = model.feature_importances_
 
@@ -300,9 +232,6 @@ class SignalMLPipeline:
 
         return X[selected_features], y
 
-
-
-
     def train_model(self, X, y):
         print("Training model...")
 
@@ -316,7 +245,8 @@ class SignalMLPipeline:
         print(f"Shape of X: {X.shape}")
         print(f"Shape of y: {y.shape}")
 
-        model = xgb.XGBClassifier(use_label_encoder=False)
+        # Remove use_label_encoder to avoid warning
+        model = xgb.XGBClassifier()  # No need to set use_label_encoder=False anymore
         model.fit(X, y)
         self.model = model
 
@@ -348,7 +278,6 @@ class SignalMLPipeline:
             step_name, func = self.step_functions[step]
             print(f"Running step: {step_name}")
             func()
-
 
 
 if __name__ == "__main__":

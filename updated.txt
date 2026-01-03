@@ -139,22 +139,22 @@ def extract_features(data):
 from sklearn.model_selection import GridSearchCV
 from xgboost import XGBClassifier
 
-def train_model(self, X, y):
-    print("Training model...")
+# def train_model(self, X, y):
+#     print("Training model...")
 
-    # Ensure that y doesn't contain NaN values
-    if y.isnull().any():
-        print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
-        X = X[~y.isnull()]
-        y = y.dropna()  # Drop rows where y is NaN
+#     # Ensure that y doesn't contain NaN values
+#     if y.isnull().any():
+#         print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
+#         X = X[~y.isnull()]
+#         y = y.dropna()  # Drop rows where y is NaN
 
-    # Ensure the selected features are not missing
-    print(f"Shape of X: {X.shape}")
-    print(f"Shape of y: {y.shape}")
+#     # Ensure the selected features are not missing
+#     print(f"Shape of X: {X.shape}")
+#     print(f"Shape of y: {y.shape}")
 
-    model = xgb.XGBClassifier(use_label_encoder=False)
-    model.fit(X, y)
-    self.model = model
+#     model = xgb.XGBClassifier(use_label_encoder=False)
+#     model.fit(X, y)
+#     self.model = model
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
@@ -231,6 +231,11 @@ class SignalMLPipeline:
         # Drop any rows with missing values in the 'Signal' column or other critical columns
         self.raw_data.dropna(subset=['Signal'], inplace=True)
 
+        # Ensure no NaN values in target (Signal) column
+        if self.raw_data['Signal'].isnull().any():
+            print("[!] Warning: NaN values detected in 'Signal'. Dropping rows with NaN values.")
+            self.raw_data.dropna(subset=['Signal'], inplace=True)
+
         # Make sure the dataset is valid for feature extraction
         self.dataset = extract_features(self.raw_data)
 
@@ -297,13 +302,23 @@ class SignalMLPipeline:
 
 
 
+
     def train_model(self, X, y):
         print("Training model...")
-        x_selected = X[self.selected_features]
-        x_processed, y_mapped, pipe = prepare_dataset_for_model(x_selected, y)
-        model = xgbmodel(x_processed, y_mapped)
+
+        # Ensure that y doesn't contain NaN values
+        if y.isnull().any():
+            print("[!] Warning: NaN values detected in y. Dropping rows with NaN values.")
+            X = X[~y.isnull()]
+            y = y.dropna()  # Drop rows where y is NaN
+
+        # Ensure the selected features are not missing
+        print(f"Shape of X: {X.shape}")
+        print(f"Shape of y: {y.shape}")
+
+        model = xgb.XGBClassifier(use_label_encoder=False)
+        model.fit(X, y)
         self.model = model
-        self.pipe = pipe
 
     def save(self):
         save_model(self.pipe, self.selected_features, self.model)
